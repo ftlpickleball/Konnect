@@ -187,6 +187,10 @@ pub fn tools() -> Vec<ToolDef> {
             "Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. \
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
+             Reads the saved files; an open schematic editor is reported under `warnings`. \
+             BOM-excluded symbols sync like any other; only `on_board no` skips one. \
+             A changed footprint is replaced at the same pose (front side only) unless \
+             `replace_footprints` is false; `delete_unmatched` removes footprints whose symbol is gone. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
              and the sync proceeds for every other component. A library footprint that \
              cannot be placed, or a connected pad its footprint does not have, makes the dry \
@@ -200,7 +204,9 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
-                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
+                    "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" },
+                    "replace_footprints": { "type": "boolean", "description": "Replace footprints whose library ID differs from the schematic", "default": true },
+                    "delete_unmatched": { "type": "boolean", "description": "Delete footprints whose schematic symbol no longer exists; board-only footprints are kept", "default": false }
                 },
                 "required": ["schematic", "board"]
             }),

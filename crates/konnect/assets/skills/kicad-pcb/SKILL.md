@@ -96,8 +96,13 @@ Follow this sequence for a clean PCB workflow:
 2. **Update from schematic** — call `update_pcb_from_schematic` first with
    `dry_run: true`. Review `status`, `coverage`, `diagnostics`, and staged positions.
    Apply only with `dry_run: false` and the exact returned
-   `expected_plan_revision` value. The saved schematic hierarchy must be closed in the
-   schematic editor, and the target board must be open in KiCad. A conflict is
+   `expected_plan_revision` value. The plan reads the saved schematic files: save
+   first, because an open schematic editor's unsaved edits are not included (the
+   response names open sheets under `warnings`). The target board must be open in
+   KiCad. BOM-excluded symbols sync like any other; only "Exclude from board" skips one.
+   A changed footprint is replaced at the same pose (`replace_footprints`, default
+   true; front side only); `delete_unmatched: true` removes footprints whose symbol
+   is gone and keeps board-only ones. A conflict is
    non-mutating; resolve it and rerun the dry run. A diagnostic about a library
    footprint names that footprint and every part that needs it: when the footprint
    cannot be placed (custom-shape pads are not supported), assign those parts a

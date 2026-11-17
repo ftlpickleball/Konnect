@@ -147,6 +147,8 @@ struct CountPair {
 struct SyncCounts {
     added: CountPair,
     updated: CountPair,
+    replaced: CountPair,
+    removed: CountPair,
     pads_reassigned: CountPair,
     board_only_preserved: CountPair,
     skipped_by_flag: CountPair,
@@ -185,6 +187,44 @@ enum PlannedChange {
         pad_nets: BTreeMap<String, String>,
         preserve: PreservedBoardState,
     },
+    /// The schematic names a different library footprint: delete the board
+    /// one and create the new one at the same pose, in the same commit.
+    Replace {
+        old_kiid: String,
+        reference: String,
+        value: String,
+        footprint_id: String,
+        old_footprint_id: String,
+        symbol_path: String,
+        dnp: bool,
+        pad_nets: BTreeMap<String, String>,
+        preserve: PreservedBoardState,
+    },
+    /// A footprint whose schematic symbol no longer exists.
+    Remove {
+        kiid: String,
+        reference: String,
+        footprint_id: String,
+    },
+}
+
+/// The GUI's Update PCB checkboxes the planner honours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SyncOptions {
+    /// "Replace footprints with those specified by symbols".
+    replace_footprints: bool,
+    /// "Delete footprints with no symbols".
+    delete_unmatched: bool,
+}
+
+impl SyncOptions {
+    /// Tool defaults match the GUI dialog: replace on, delete off.
+    fn from_args(args: &serde_json::Value) -> Self {
+        Self {
+            replace_footprints: args["replace_footprints"].as_bool().unwrap_or(true),
+            delete_unmatched: args["delete_unmatched"].as_bool().unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -217,6 +257,9 @@ struct SyncPlan {
     /// Not part of the plan's identity: `sync_response` reports it.
     #[serde(skip)]
     staging: Option<StagingEvidence>,
+    /// Hierarchy sheets open in the schematic editor; set by the handler.
+    #[serde(skip)]
+    open_in_editor: Vec<String>,
 }
 
 /// What added footprints were staged beside (#688).
@@ -300,6 +343,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let options = SyncOptions::from_args(args);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -332,6 +376,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             )))
         }
     };
+    let open_in_editor = sheets_open_in_editor(&hierarchy);
     let temp = tempfile::Builder::new().suffix(".net").tempfile()?;
     if let Err(error) =
         super::cli::export_netlist(&ctx.config.kicad_cli, &schematic, temp.path(), "kicadsexpr")
@@ -376,8 +421,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan = plan_sync_with(&netlist_source, &design, &snapshot.state, options);
             plan.staging = Some(snapshot.staging.clone());
+            plan.open_in_editor = open_in_editor.clone();
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
             // means ready: each footprint that cannot be prepared, named with
@@ -419,10 +465,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 return Ok(sync_response(&plan, "noop", hierarchy.len(), false));
             }
 
-            let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
+            let (creates, updates, deletes) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
             client.run_commit_recovering_in(snapshot.document.clone(), "Update PCB from saved schematic", |client| {
+                // Deleted first, so a replacement never shares its reference
+                // with the footprint it replaces.
+                client.delete_items_in(snapshot.document.clone(), deletes)?;
                 create_sync_items_in(client, &snapshot.document, &creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
@@ -441,6 +490,8 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             }
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
+            plan.counts.replaced.applied = plan.counts.replaced.planned;
+            plan.counts.removed.applied = plan.counts.removed.planned;
             plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
             plan.counts.board_only_preserved.applied =
                 plan.counts.board_only_preserved.planned;
@@ -496,6 +547,8 @@ fn sync_response(
             "atomicity": "single_kicad_undo_commit",
             "footprints_added": plan.counts.added,
             "footprints_updated": plan.counts.updated,
+            "footprints_replaced": plan.counts.replaced,
+            "footprints_removed": plan.counts.removed,
             "pads_reassigned": plan.counts.pads_reassigned,
             "board_only_preserved": plan.counts.board_only_preserved,
             "skipped_by_flag": plan.counts.skipped_by_flag,
@@ -513,9 +566,21 @@ fn sync_response(
         // measured it, with the classes it would not list (#688). Null only
         // when the plan never reached the board.
         "staging": plan.staging.as_ref().map(StagingEvidence::json),
+        "warnings": open_in_editor_warnings(&plan.open_in_editor),
         "undo": if applied { Some("Ctrl-Z reverses the whole schematic-to-PCB update.") } else { None }
     });
     CallToolResult::json(&value)
+}
+
+fn open_in_editor_warnings(files: &[String]) -> Vec<serde_json::Value> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    vec![serde_json::json!({
+        "code": "schematic_open_in_editor",
+        "message": "planned from the saved schematic files; unsaved editor changes are not included",
+        "files": files,
+    })]
 }
 
 /// A refusal before any plan exists: the saved hierarchy, the netlist export
@@ -529,6 +594,8 @@ fn conflict_result(message: String) -> CallToolResult {
             "transport": "live_kicad_ipc",
             "footprints_added": CountPair::default(),
             "footprints_updated": CountPair::default(),
+            "footprints_replaced": CountPair::default(),
+            "footprints_removed": CountPair::default(),
             "pads_reassigned": CountPair::default(),
             "board_only_preserved": CountPair::default(),
             "skipped_by_flag": CountPair::default(),
@@ -545,7 +612,17 @@ fn conflict_result(message: String) -> CallToolResult {
     }
 }
 
+#[cfg(test)]
 fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    plan_sync_with(netlist_source, design, board, SyncOptions::default())
+}
+
+fn plan_sync_with(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    options: SyncOptions,
+) -> SyncPlan {
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
@@ -793,14 +870,48 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             }
         }
         if footprint.footprint_id != component.footprint_id {
-            diagnostics.push(conflict(
-                "footprint_id_changed",
-                format!(
-                    "{} uses {} on the board but {} in the schematic",
-                    component.reference, footprint.footprint_id, component.footprint_id
-                ),
-                Some(&component.reference),
-            ));
+            if !options.replace_footprints {
+                diagnostics.push(conflict(
+                    "footprint_id_changed",
+                    format!(
+                        "{} uses {} on the board but {} in the schematic",
+                        component.reference, footprint.footprint_id, component.footprint_id
+                    ),
+                    Some(&component.reference),
+                ));
+                continue;
+            }
+            if footprint.layer != "F.Cu" {
+                diagnostics.push(conflict(
+                    "footprint_replace_back_side",
+                    format!(
+                        "{} is on {}; replacing it with {} is front-side only. Flip it to F.Cu, \
+                         sync, and flip it back",
+                        component.reference, footprint.layer, component.footprint_id
+                    ),
+                    Some(&component.reference),
+                ));
+                continue;
+            }
+            let changed_pads = pad_net_changes(component, footprint, board, &mut diagnostics);
+            changes.push(PlannedChange::Replace {
+                old_kiid: footprint.kiid.clone(),
+                reference: component.reference.clone(),
+                value: component.value.clone(),
+                footprint_id: component.footprint_id.clone(),
+                old_footprint_id: footprint.footprint_id.clone(),
+                symbol_path: component.symbol_path.clone(),
+                dnp: component.dnp,
+                pad_nets: component.pad_nets.clone(),
+                preserve: PreservedBoardState {
+                    position: footprint.position,
+                    rotation: footprint.rotation,
+                    layer: footprint.layer.clone(),
+                    locked: footprint.locked,
+                },
+            });
+            counts.replaced.planned += 1;
+            counts.pads_reassigned.planned += changed_pads;
             continue;
         }
         // A pad the schematic connects and the live footprint lacks used to
@@ -816,39 +927,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             continue;
         }
 
-        let mut changed_pads = 0usize;
-        let pad_numbers = component
-            .pad_nets
-            .keys()
-            .chain(footprint.pad_nets.keys())
-            .collect::<std::collections::BTreeSet<_>>();
-        for number in pad_numbers {
-            let new_net = component
-                .pad_nets
-                .get(number)
-                .map(String::as_str)
-                .unwrap_or("");
-            let old_net = footprint
-                .pad_nets
-                .get(number)
-                .map(String::as_str)
-                .unwrap_or("");
-            if old_net == new_net {
-                continue;
-            }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
-                diagnostics.push(conflict(
-                    "routed_pad_net_change",
-                    format!(
-                        "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
-                        component.reference, number, old_net, new_net
-                    ),
-                    Some(&component.reference),
-                ));
-            } else {
-                changed_pads += 1;
-            }
-        }
+        let changed_pads = pad_net_changes(component, footprint, board, &mut diagnostics);
 
         let needs_update = footprint.reference != component.reference
             || footprint.value != component.value
@@ -875,12 +954,33 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         }
     }
 
-    counts.board_only_preserved.planned = board.footprints.len() - matched.len();
+    // Only a footprint that once had a symbol can have lost it; one with no
+    // symbol path or flagged `not_in_schematic` is board-only and stays.
+    if options.delete_unmatched {
+        for (index, footprint) in board.footprints.iter().enumerate() {
+            if matched.contains(&index)
+                || footprint.symbol_path.is_none()
+                || footprint.not_in_schematic
+            {
+                continue;
+            }
+            changes.push(PlannedChange::Remove {
+                kiid: footprint.kiid.clone(),
+                reference: footprint.reference.clone(),
+                footprint_id: footprint.footprint_id.clone(),
+            });
+            counts.removed.planned += 1;
+        }
+    }
+    counts.board_only_preserved.planned =
+        board.footprints.len() - matched.len() - counts.removed.planned;
     counts.conflicts.planned = diagnostics.len();
     if !diagnostics.is_empty() {
         changes.clear();
         counts.added.planned = 0;
         counts.updated.planned = 0;
+        counts.replaced.planned = 0;
+        counts.removed.planned = 0;
         counts.pads_reassigned.planned = 0;
     }
     let status = if !diagnostics.is_empty() {
@@ -900,7 +1000,52 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         unassigned,
         // Set by the handler from the snapshot this plan was made against.
         staging: None,
+        open_in_editor: Vec::new(),
     }
+}
+
+/// Pads whose net would change. A change on a net routed copper uses is a
+/// conflict pushed to `diagnostics`; the rest are counted.
+fn pad_net_changes(
+    component: &DesignComponent,
+    footprint: &BoardFootprint,
+    board: &BoardState,
+    diagnostics: &mut Vec<SyncDiagnostic>,
+) -> usize {
+    let mut changed_pads = 0usize;
+    let pad_numbers = component
+        .pad_nets
+        .keys()
+        .chain(footprint.pad_nets.keys())
+        .collect::<BTreeSet<_>>();
+    for number in pad_numbers {
+        let new_net = component
+            .pad_nets
+            .get(number)
+            .map(String::as_str)
+            .unwrap_or("");
+        let old_net = footprint
+            .pad_nets
+            .get(number)
+            .map(String::as_str)
+            .unwrap_or("");
+        if old_net == new_net {
+            continue;
+        }
+        if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            diagnostics.push(conflict(
+                "routed_pad_net_change",
+                format!(
+                    "{} pad {} would change from '{}' to '{}' while routed copper uses that net",
+                    component.reference, number, old_net, new_net
+                ),
+                Some(&component.reference),
+            ));
+        } else {
+            changed_pads += 1;
+        }
+    }
+    changed_pads
 }
 
 fn conflict(code: &str, message: String, reference: Option<&str>) -> SyncDiagnostic {
@@ -1543,17 +1688,6 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
             return Ok(());
         }
         active.insert(canonical.clone());
-        let name = canonical
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("schematic path has no file name")?;
-        let lock = canonical.with_file_name(format!("~{name}.lck"));
-        if lock.exists() {
-            bail!(
-                "{} is open in the schematic editor; save and close the hierarchy before syncing",
-                canonical.display()
-            );
-        }
         let schematic = konnect_schematic_editor::Schematic::load(&canonical)
             .with_context(|| format!("cannot load schematic {}", canonical.display()))?;
         files.push(canonical.clone());
@@ -1576,6 +1710,20 @@ fn saved_hierarchy_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     visit(root, &mut HashSet::new(), &mut HashSet::new(), &mut files)?;
     Ok(files)
+}
+
+/// Sheets KiCad holds a `~<name>.lck` for. The sync reads saved files, so
+/// unsaved edits in an open editor are not in the plan; the response says so.
+fn sheets_open_in_editor(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|file| {
+            file.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| file.with_file_name(format!("~{name}.lck")).exists())
+        })
+        .map(|file| file.display().to_string())
+        .collect()
 }
 
 fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> Result<()> {
@@ -1657,9 +1805,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
+        // `in_bom` is a BOM flag only; eeschema's Update PCB reads `on_board`.
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1670,9 +1816,8 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         component.dnp = entry.dnp;
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
+    // The same flag governs a component with no footprint: excluded from the
+    // board it is skipped by flag rather than reported as unassigned.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1685,9 +1830,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1698,7 +1840,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -2057,11 +2199,16 @@ fn prepare_additions(
     let mut prepared = BTreeMap::new();
     let mut unprepared: BTreeMap<String, UnpreparedFootprint> = BTreeMap::new();
     for change in &plan.changes {
-        let PlannedChange::Add {
+        let (PlannedChange::Add {
             footprint_id,
             reference,
             ..
-        } = change
+        }
+        | PlannedChange::Replace {
+            footprint_id,
+            reference,
+            ..
+        }) = change
         else {
             continue;
         };
@@ -2101,12 +2248,18 @@ fn additions_missing_pads(
 ) -> Vec<SyncDiagnostic> {
     let mut diagnostics = Vec::new();
     for change in &plan.changes {
-        let PlannedChange::Add {
+        let (PlannedChange::Add {
             reference,
             footprint_id,
             pad_nets,
             ..
-        } = change
+        }
+        | PlannedChange::Replace {
+            reference,
+            footprint_id,
+            pad_nets,
+            ..
+        }) = change
         else {
             continue;
         };
@@ -2133,6 +2286,8 @@ fn refuse_plan(plan: &mut SyncPlan, diagnostics: Vec<SyncDiagnostic>) {
     plan.status = PlanStatus::Conflict;
     plan.counts.added.planned = 0;
     plan.counts.updated.planned = 0;
+    plan.counts.replaced.planned = 0;
+    plan.counts.removed.planned = 0;
     plan.counts.pads_reassigned.planned = 0;
     plan.counts.conflicts.planned += diagnostics.len();
     plan.diagnostics.extend(diagnostics);
@@ -2226,18 +2381,51 @@ fn build_added_footprint(
     part: &PreparedFootprint,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<prost_types::Any> {
-    let PlannedChange::Add {
-        reference,
-        value,
-        footprint_id,
-        symbol_path,
-        dnp,
-        pad_nets,
-        position,
-    } = change
-    else {
-        bail!("only a planned addition builds a new footprint");
-    };
+    let (reference, value, footprint_id, symbol_path, dnp, pad_nets, position, rotation, locked) =
+        match change {
+            PlannedChange::Add {
+                reference,
+                value,
+                footprint_id,
+                symbol_path,
+                dnp,
+                pad_nets,
+                position,
+            } => (
+                reference,
+                value,
+                footprint_id,
+                symbol_path,
+                dnp,
+                pad_nets,
+                *position,
+                0.0,
+                false,
+            ),
+            // `plan_sync_with` refuses back-side replacements, so the pose is
+            // always front-side here.
+            PlannedChange::Replace {
+                reference,
+                value,
+                footprint_id,
+                symbol_path,
+                dnp,
+                pad_nets,
+                preserve,
+                ..
+            } => (
+                reference,
+                value,
+                footprint_id,
+                symbol_path,
+                dnp,
+                pad_nets,
+                preserve.position,
+                preserve.rotation,
+                preserve.locked,
+            ),
+            _ => bail!("only an addition or replacement builds a new footprint"),
+        };
     let item = konnect_ipc::KiCadIpcClient::build_footprint_item(
         footprint_id,
         reference,
@@ -2247,11 +2435,14 @@ fn build_added_footprint(
         &part.fields,
         position.x,
         position.y,
-        0.0,
+        rotation,
         "F.Cu",
     )?;
     let mut footprint =
         konnect_ipc::gen::kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+    if locked {
+        footprint.locked = konnect_ipc::gen::kiapi::common::types::LockedState::LsLocked as i32;
+    }
     apply_library_data(&mut footprint, part)?;
     apply_footprint_fields(
         &mut footprint,
@@ -2272,9 +2463,10 @@ fn build_mutation_items(
     plan: &SyncPlan,
     prepared: &BTreeMap<String, PreparedFootprint>,
     snapshot: &LiveSnapshot,
-) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>)> {
+) -> Result<(Vec<prost_types::Any>, Vec<prost_types::Any>, Vec<String>)> {
     let mut creates = Vec::new();
     let mut updates = Vec::new();
+    let mut deletes = Vec::new();
     for change in &plan.changes {
         match change {
             PlannedChange::Add { footprint_id, .. } => {
@@ -2282,6 +2474,26 @@ fn build_mutation_items(
                     .get(footprint_id)
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
                 creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
+            }
+            PlannedChange::Replace {
+                old_kiid,
+                footprint_id,
+                ..
+            } => {
+                if !snapshot.items.contains_key(old_kiid) {
+                    bail!("planned footprint {old_kiid} disappeared");
+                }
+                let part = prepared
+                    .get(footprint_id)
+                    .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
+                deletes.push(old_kiid.clone());
+                creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
+            }
+            PlannedChange::Remove { kiid, .. } => {
+                if !snapshot.items.contains_key(kiid) {
+                    bail!("planned footprint {kiid} disappeared");
+                }
+                deletes.push(kiid.clone());
             }
             PlannedChange::Update { kiid, .. } => {
                 let item = snapshot
@@ -2292,7 +2504,7 @@ fn build_mutation_items(
             }
         }
     }
-    Ok((creates, updates))
+    Ok((creates, updates, deletes))
 }
 
 #[cfg(test)]
@@ -4531,6 +4743,7 @@ mod tests {
             diagnostics: Vec::new(),
             unassigned: Vec::new(),
             staging: None,
+            open_in_editor: Vec::new(),
         }
     }
 
@@ -5583,5 +5796,350 @@ mod tests {
             "{}",
             refusal.1
         );
+    }
+
+    /// A schematic editor open on a saved, unchanged hierarchy must not block
+    /// the sync: it reads the saved files either way.
+    #[test]
+    fn an_open_schematic_editor_does_not_refuse_the_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("board.kicad_sch");
+        std::fs::write(&root, include_str!("../../tests/fixtures/test.kicad_sch")).unwrap();
+        std::fs::write(directory.path().join("~board.kicad_sch.lck"), "{}").unwrap();
+
+        let hierarchy = saved_hierarchy_files(&root).expect("a lock file is not fatal");
+
+        assert_eq!(hierarchy.len(), 1);
+        assert_eq!(sheets_open_in_editor(&hierarchy).len(), 1);
+        let closed = tempfile::tempdir().unwrap();
+        let unlocked = closed.path().join("board.kicad_sch");
+        std::fs::copy(&root, &unlocked).unwrap();
+        assert!(sheets_open_in_editor(&[unlocked]).is_empty());
+    }
+
+    /// The response tells the caller which sheets were open, so it knows the
+    /// plan used saved files.
+    #[test]
+    fn the_response_warns_about_sheets_open_in_the_editor() {
+        let mut plan = plan_sync("netlist", &unassigned_design(), &board_with(vec![]));
+        plan.open_in_editor = vec!["/p/root.kicad_sch".to_string()];
+        let value = response_json(&sync_response(&plan, "ready", 1, false));
+
+        let warnings = value["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], "schematic_open_in_editor");
+        assert_eq!(warnings[0]["files"][0], "/p/root.kicad_sch");
+    }
+
+    fn response_json(result: &CallToolResult) -> serde_json::Value {
+        match result.content.first() {
+            Some(ToolContent::Text { text }) => serde_json::from_str(text).unwrap(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// Symbol `TP1` is excluded from the BOM and fitted on the board; `R9` is
+    /// excluded from both. Instance paths use the root sheet.
+    const BOM_EXCLUDED_SCHEMATIC: &str = r#"
+(kicad_sch
+  (uuid "root-uuid")
+  (symbol (lib_id "Connector:TestPoint") (in_bom no) (on_board yes) (dnp no)
+    (uuid "tp-uuid")
+    (instances (project "p" (path "/root-uuid" (reference "TP1") (unit 1)))))
+  (symbol (lib_id "Device:R") (in_bom no) (on_board no) (dnp no)
+    (uuid "r9-uuid")
+    (instances (project "p" (path "/root-uuid" (reference "R9") (unit 1))))))
+"#;
+
+    fn test_point(symbol_path: &str, net: &str) -> DesignComponent {
+        DesignComponent {
+            reference: "TP1".to_string(),
+            value: "TestPoint".to_string(),
+            footprint_id: "TestPoint:TestPoint_Pad_D1.0mm".to_string(),
+            symbol_path: symbol_path.to_string(),
+            dnp: false,
+            pad_nets: BTreeMap::from([("1".to_string(), net.to_string())]),
+        }
+    }
+
+    fn saved_flags_applied(design: &mut ExportedDesign) {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("root.kicad_sch");
+        std::fs::write(&file, BOM_EXCLUDED_SCHEMATIC).unwrap();
+        apply_saved_symbol_flags(&[file], design).unwrap();
+    }
+
+    /// KiCad's Update PCB ignores `in_bom`: a BOM-excluded test point is still
+    /// a schematic part whose pad nets follow the schematic.
+    #[test]
+    fn a_bom_excluded_footprint_is_renetted() {
+        let path = "/root-uuid/tp-uuid";
+        let mut design = ExportedDesign {
+            components: vec![test_point(path, "VBUS")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        saved_flags_applied(&mut design);
+        assert_eq!(design.components.len(), 1, "TP1 must stay in the design");
+
+        let mut on_board = board_resistor("TP1", Some(path));
+        on_board.value = "TestPoint".to_string();
+        on_board.footprint_id = "TestPoint:TestPoint_Pad_D1.0mm".to_string();
+        on_board.pad_numbers = BTreeSet::from(["1".to_string()]);
+        on_board.pad_nets = BTreeMap::from([("1".to_string(), "OLD".to_string())]);
+        let plan = plan_sync("netlist", &design, &board_with(vec![on_board]));
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.board_only_preserved.planned, 0);
+        assert_eq!(plan.counts.pads_reassigned.planned, 1);
+    }
+
+    const REPLACE: SyncOptions = SyncOptions {
+        replace_footprints: true,
+        delete_unmatched: false,
+    };
+
+    fn one_resistor_design() -> ExportedDesign {
+        ExportedDesign {
+            components: vec![resistor("R1", "/sheet/existing")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        }
+    }
+
+    fn swapped_r1() -> BoardFootprint {
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
+        footprint.rotation = 90.0;
+        footprint.locked = true;
+        footprint
+    }
+
+    /// A changed footprint is replaced in place, the way the GUI's "Replace
+    /// footprints with those specified by symbols" does.
+    #[test]
+    fn a_changed_footprint_is_replaced_keeping_its_pose() {
+        let plan = plan_sync_with(
+            "netlist",
+            &one_resistor_design(),
+            &board_with(vec![swapped_r1()]),
+            REPLACE,
+        );
+
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.replaced.planned, 1);
+        let [PlannedChange::Replace {
+            old_kiid,
+            footprint_id,
+            old_footprint_id,
+            preserve,
+            ..
+        }] = plan.changes.as_slice()
+        else {
+            panic!("expected one replacement, got {:?}", plan.changes);
+        };
+        assert_eq!(old_kiid, "R1-kiid");
+        assert_eq!(footprint_id, "Resistor_SMD:R_0603_1608Metric");
+        assert_eq!(old_footprint_id, "Resistor_SMD:R_0805_2012Metric");
+        assert_eq!(preserve.rotation, 90.0);
+        assert!(preserve.locked);
+    }
+
+    #[test]
+    fn replacement_off_keeps_the_footprint_id_conflict() {
+        let plan = plan_sync_with(
+            "netlist",
+            &one_resistor_design(),
+            &board_with(vec![swapped_r1()]),
+            SyncOptions::default(),
+        );
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert_eq!(plan.counts.replaced.planned, 0);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "footprint_id_changed"));
+    }
+
+    /// A library footprint built for the front would land on the back with
+    /// front-side pads, so a back-side replacement is refused, not guessed.
+    #[test]
+    fn a_back_side_replacement_is_a_conflict() {
+        let mut footprint = swapped_r1();
+        footprint.layer = "B.Cu".to_string();
+        let plan = plan_sync_with(
+            "netlist",
+            &one_resistor_design(),
+            &board_with(vec![footprint]),
+            REPLACE,
+        );
+
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "footprint_replace_back_side"));
+    }
+
+    /// The tool default replaces, as the GUI does; deletion stays opt-in.
+    #[test]
+    fn tool_defaults_replace_and_keep_unmatched_footprints() {
+        let options = SyncOptions::from_args(&serde_json::json!({}));
+        assert!(options.replace_footprints);
+        assert!(!options.delete_unmatched);
+
+        let options = SyncOptions::from_args(&serde_json::json!({
+            "replace_footprints": false,
+            "delete_unmatched": true
+        }));
+        assert!(!options.replace_footprints);
+        assert!(options.delete_unmatched);
+    }
+
+    /// Deletion removes footprints whose symbol is gone; footprints placed on
+    /// the board with no symbol are never schematic parts and stay.
+    #[test]
+    fn delete_unmatched_removes_orphans_but_keeps_board_only_footprints() {
+        let orphan = board_resistor("R7", Some("/sheet/deleted"));
+        let logo = board_resistor("LOGO1", None);
+        let mut fiducial = board_resistor("FID1", Some("/sheet/fid"));
+        fiducial.not_in_schematic = true;
+        let board = board_with(vec![
+            board_resistor("R1", Some("/sheet/existing")),
+            orphan,
+            logo,
+            fiducial,
+        ]);
+
+        let kept = plan_sync_with("netlist", &one_resistor_design(), &board, REPLACE);
+        assert_eq!(kept.status, PlanStatus::Noop);
+        assert_eq!(kept.counts.board_only_preserved.planned, 3);
+
+        let plan = plan_sync_with(
+            "netlist",
+            &one_resistor_design(),
+            &board,
+            SyncOptions {
+                delete_unmatched: true,
+                ..REPLACE
+            },
+        );
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.counts.removed.planned, 1);
+        assert_eq!(plan.counts.board_only_preserved.planned, 2);
+        assert!(matches!(
+            plan.changes.as_slice(),
+            [PlannedChange::Remove { kiid, reference, .. }] if kiid == "R7-kiid" && reference == "R7"
+        ));
+    }
+
+    /// Callers read every change category from `coverage`.
+    #[test]
+    fn the_response_reports_replaced_and_removed() {
+        let plan = plan_sync_with(
+            "netlist",
+            &one_resistor_design(),
+            &board_with(vec![swapped_r1(), board_resistor("R7", Some("/gone"))]),
+            SyncOptions {
+                delete_unmatched: true,
+                ..REPLACE
+            },
+        );
+        let value = response_json(&sync_response(&plan, "ready", 1, false));
+
+        assert_eq!(value["coverage"]["footprints_replaced"]["planned"], 1);
+        assert_eq!(value["coverage"]["footprints_removed"]["planned"], 1);
+    }
+
+    /// A replacement deletes the old KIID and creates the new library
+    /// footprint at the old pose, locked state and nets; a removal deletes.
+    #[test]
+    fn replace_and_remove_build_deletes_and_a_posed_create() {
+        use konnect_ipc::gen::kiapi;
+
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let part = prepare_footprint_source(source).unwrap();
+        let mut component = resistor("R1", "/sheet/existing");
+        component.footprint_id = "Capacitor_SMD:C_0603_1608Metric".to_string();
+        let design = ExportedDesign {
+            components: vec![component],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        let mut old = swapped_r1();
+        old.position = Point { x: 12.0, y: 34.0 };
+        let board = board_with(vec![old, board_resistor("R7", Some("/gone"))]);
+        let plan = plan_sync_with(
+            "netlist",
+            &design,
+            &board,
+            SyncOptions {
+                delete_unmatched: true,
+                ..REPLACE
+            },
+        );
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+
+        let placeholder = konnect_ipc::builders::pack_any(
+            &kiapi::board::types::FootprintInstance::default(),
+            "kiapi.board.types.FootprintInstance",
+        );
+        let snapshot = LiveSnapshot {
+            state: board.clone(),
+            staging: StagingEvidence {
+                measured: true,
+                unavailable: Vec::new(),
+            },
+            items: BTreeMap::from([
+                ("R1-kiid".to_string(), placeholder.clone()),
+                ("R7-kiid".to_string(), placeholder),
+            ]),
+            net_codes: BTreeMap::new(),
+            document: Default::default(),
+        };
+        let prepared = BTreeMap::from([("Capacitor_SMD:C_0603_1608Metric".to_string(), part)]);
+
+        let (creates, updates, deletes) =
+            build_mutation_items(&plan, &prepared, &snapshot).unwrap();
+
+        assert!(updates.is_empty());
+        let mut deleted = deletes.clone();
+        deleted.sort();
+        assert_eq!(deleted, ["R1-kiid", "R7-kiid"]);
+        assert_eq!(creates.len(), 1);
+        let created =
+            kiapi::board::types::FootprintInstance::decode(creates[0].value.as_slice()).unwrap();
+        let built = board_footprint_from_instance(&kiapi::board::types::FootprintInstance {
+            id: Some(kiapi::common::types::Kiid {
+                value: "new".to_string(),
+            }),
+            ..created
+        })
+        .unwrap();
+        assert_eq!(built.reference, "R1");
+        assert_eq!(built.footprint_id, "Capacitor_SMD:C_0603_1608Metric");
+        assert_eq!(built.symbol_path.as_deref(), Some("/sheet/existing"));
+        assert!((built.position.x - 12.0).abs() < 1e-6);
+        assert!((built.position.y - 34.0).abs() < 1e-6);
+        assert_eq!(built.rotation, 90.0);
+        assert!(built.locked);
+        assert_eq!(built.layer, "F.Cu");
+        assert_eq!(built.pad_nets.get("1").map(String::as_str), Some("VCC"));
+    }
+
+    /// `on_board no` alone decides the skip, whatever `in_bom` says.
+    #[test]
+    fn a_part_excluded_from_bom_and_board_is_skipped_by_flag() {
+        let mut design = ExportedDesign {
+            components: vec![resistor("R9", "/root-uuid/r9-uuid")],
+            skipped: Vec::new(),
+            unassigned: Vec::new(),
+        };
+        saved_flags_applied(&mut design);
+
+        assert!(design.components.is_empty());
+        assert_eq!(design.skipped.len(), 1);
+        assert_eq!(design.skipped[0].reference, "R9");
     }
 }
