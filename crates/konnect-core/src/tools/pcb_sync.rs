@@ -1896,16 +1896,12 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
+    let zones = client
         .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
-        for net in net_codes.keys() {
-            *routed_nets.entry(net.clone()).or_insert(0) += 1;
-        }
-    }
+        .iter()
+        .map(|item| kiapi::board::types::Zone::decode(item.value.as_slice()).unwrap_or_default())
+        .collect::<Vec<_>>();
+    record_zone_nets(&mut routed_nets, &zones, &net_codes);
     // Every item KiCad holds, measured as KiCad measures it (#688). A board
     // with nothing measured stages from the origin. The classes KiCad would
     // not list are kept, so the response can say the extent is partial, and
@@ -2074,6 +2070,30 @@ fn board_layer_name(layer: i32) -> String {
         Some(BoardLayer::BlBCu) => "B.Cu".to_string(),
         Some(layer) => layer.as_str_name().to_string(),
         None => format!("layer_{layer}"),
+    }
+}
+
+/// Rule areas and graphical zones hold no copper; a copper zone routes its
+/// own net. A zone of any other or unreadable type fails closed: every net.
+fn record_zone_nets(
+    routed: &mut BTreeMap<String, usize>,
+    zones: &[konnect_ipc::gen::kiapi::board::types::Zone],
+    net_codes: &BTreeMap<String, i32>,
+) {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, ZoneType};
+
+    for zone in zones {
+        match (ZoneType::try_from(zone.r#type), &zone.settings) {
+            (Ok(ZoneType::ZtRuleArea | ZoneType::ZtGraphical), _) => {}
+            (Ok(ZoneType::ZtCopper), Some(Settings::CopperSettings(copper))) => {
+                record_routed_net(routed, copper.net.as_ref());
+            }
+            _ => {
+                for net in net_codes.keys() {
+                    *routed.entry(net.clone()).or_insert(0) += 1;
+                }
+            }
+        }
     }
 }
 
@@ -6126,6 +6146,45 @@ mod tests {
         assert!(built.locked);
         assert_eq!(built.layer, "F.Cu");
         assert_eq!(built.pad_nets.get("1").map(String::as_str), Some("VCC"));
+    }
+
+    fn zone(
+        kind: konnect_ipc::gen::kiapi::board::types::ZoneType,
+        net: Option<&str>,
+    ) -> konnect_ipc::gen::kiapi::board::types::Zone {
+        use konnect_ipc::gen::kiapi::board::types as t;
+        t::Zone {
+            r#type: kind as i32,
+            settings: net.map(|name| {
+                t::zone::Settings::CopperSettings(t::CopperZoneSettings {
+                    net: Some(t::Net {
+                        name: name.to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A keepout rule area holds no copper, so it must not freeze every
+    /// pad net on the board; a copper zone freezes only its own net.
+    #[test]
+    fn only_copper_zones_mark_their_net_routed() {
+        use konnect_ipc::gen::kiapi::board::types::ZoneType;
+        let nets = BTreeMap::from([("GND".to_string(), 1), ("VBUS".to_string(), 2)]);
+
+        let mut routed = BTreeMap::new();
+        record_zone_nets(&mut routed, &[zone(ZoneType::ZtRuleArea, None)], &nets);
+        assert!(routed.is_empty());
+
+        record_zone_nets(&mut routed, &[zone(ZoneType::ZtCopper, Some("GND"))], &nets);
+        assert_eq!(routed.keys().collect::<Vec<_>>(), ["GND"]);
+
+        let mut unknown = BTreeMap::new();
+        record_zone_nets(&mut unknown, &[zone(ZoneType::ZtUnknown, None)], &nets);
+        assert_eq!(unknown.len(), 2, "an unreadable zone fails closed");
     }
 
     /// `on_board no` alone decides the skip, whatever `in_bom` says.
